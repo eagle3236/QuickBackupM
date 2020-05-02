@@ -7,10 +7,14 @@ import sys
 import time
 from threading import Lock
 
+
+'''================ 可修改常量开始 ================'''
+SizeWarnLimit = 25
 SlotCount = 5
 Prefix = '!!qb'
 BackupPath = './qb_multi'
 TurnOffAutoSave = True
+IgnoreSessionLock = True
 WorldNames = [
 	'world',
 ]
@@ -26,8 +30,8 @@ MinimumPermissionLevel = {
 }
 OverwriteBackupFolder = 'overwrite'
 ServerPath = './server'
-SharePath = '/home/shared'
-ShareAddress = '192.168.0.0'
+'''================ 可修改常量结束 ================'''
+
 HelpMessage = '''
 ------MCDR Multi Quick Backup------
 一个支持多槽位的快速§a备份§r&§c回档§r插件
@@ -39,7 +43,6 @@ HelpMessage = '''
 §7{0} confirm§r 在执行back后使用，再次确认是否进行§c回档§r
 §7{0} abort§r 在任何时候键入此指令可中断§c回档§r
 §7{0} list§r 显示各槽位的存档信息
-§7{0} share §6[<slot>]§r 分享存档至云盘
 当§6<slot>§r未被指定时默认选择槽位§61§r
 §a【例子】§r
 §7{0} make
@@ -53,7 +56,6 @@ game_saved = False
 plugin_unloaded = False
 creating_backup = Lock()
 restoring_backup = Lock()
-sharing_backup = Lock()
 '''
 mcdr_root/
 	server/
@@ -83,8 +85,10 @@ def print_message(server, info, msg, tell=True):
 
 
 def copy_worlds(src, dst):
+	def filter_ignore(path, files):
+		return [file for file in files if file == 'session.lock' and IgnoreSessionLock]
 	for world in WorldNames:
-		shutil.copytree('{}/{}'.format(src, world), '{}/{}'.format(dst, world))
+		shutil.copytree('{}/{}'.format(src, world), '{}/{}'.format(dst, world), ignore=filter_ignore)
 
 
 def remove_worlds(folder):
@@ -186,22 +190,21 @@ def create_backup(server, info, comment):
 				server.reply(info, '插件重载，§a备份§r中断！')
 				return
 		slot_path = get_slot_folder(1)
-		try:
-			copy_worlds(ServerPath, slot_path)
-		except Exception as e:
-			info_message(server, info, '§a备份§r失败，错误代码{}'.format(e))
-		else:
-			slot_info = {'time': format_time()}
-			if comment is not None:
-				slot_info['comment'] = comment
-			with open('{}/info.json'.format(slot_path), 'w') as f:
-				if sys.version_info.major == 2:
-					json.dump(slot_info, f, indent=4, encoding='utf8')
-				else:
-					json.dump(slot_info, f, indent=4)
-			end_time = time.time()
-			info_message(server, info, '§a备份§r完成，耗时' + str(end_time - start_time)[:3] + '秒')
-			info_message(server, info, format_slot_info(info_dict=slot_info))
+
+		copy_worlds(ServerPath, slot_path)
+		slot_info = {'time': format_time()}
+		if comment is not None:
+			slot_info['comment'] = comment
+		with open('{}/info.json'.format(slot_path), 'w') as f:
+			if sys.version_info.major == 2:
+				json.dump(slot_info, f, indent=4, encoding='utf8')
+			else:
+				json.dump(slot_info, f, indent=4)
+		end_time = time.time()
+		info_message(server, info, '§a备份§r完成，耗时§6{}§r秒'.format(round(end_time - start_time, 1)))
+		info_message(server, info, format_slot_info(info_dict=slot_info))
+	except Exception as e:
+		info_message(server, info, '§a备份§r失败，错误代码{}'.format(e))
 	finally:
 		creating_backup.release()
 		if TurnOffAutoSave:
@@ -316,36 +319,22 @@ def kick_bots(server, info):
 		pass
 
 
-def share_backup(server, info, slot):
-	global sharing_backup
-	acquired = sharing_backup.acquire(blocking=False)
-	if not acquired:
-		info_message(server, info, '正在分享存档至云盘中，请不要重复输入')
-		return
-	try:
-		ret = slot_check(server, info, slot)
-		if ret is None:
-			return
-		else:
-			slot, slot_info = ret
-
-		dir_name = slot_info['time'].replace(' ', '_')
-		info_message(server, info, '传输中...请稍等')
-		if SharePath == '':  # wtf r u doing
-			info_message(server, info, '[ERROR] WRONG SHARE PATH WTF')
-			return
-		else:
-			os.system('ssh root@{} "rm -rf {}/*" > nul'.format(ShareAddress, SharePath))
-		for world in WorldNames:
-			os.system('scp -r {}/{} root@{}:{}/{} > nul'.format(get_slot_folder(slot), world, ShareAddress, SharePath, dir_name))
-		info_message(server, info, '已经成功分享到内服云盘')
-	finally:
-		sharing_backup.release()
-
-
+def getdirsize(dir):
+   size = 0
+   for root, dirs, files in os.walk(dir):
+	  size += sum([os.path.getsize(os.path.join(root, name)) for name in files])
+   return round((size/(1024*1024*1024)) , 4)
+	
 def list_backup(server, info):
+	global SizeWarnLimit
+	size = getdirsize(BackupPath)
+	if(size >= SizeWarnLimit):
+		color = '§4'
+	else:
+		color = '§a'
 	for i in range(SlotCount):
 		info_message(server, info, '[槽位§6{}§r] {}'.format(i + 1, format_slot_info(slot_number=i + 1)))
+	info_message(server, info, '备份总占用空间：{}{} §rGB'.format(color, size))
 
 
 def trigger_abort(server, info):
@@ -386,9 +375,6 @@ def onServerInfo(server, info):
 	# back [<slot>]
 	elif cmdLen in [1, 2] and command[0] == 'back':
 		restore_backup(server, info, command[1] if cmdLen == 2 else '1')
-	# del
-	elif cmdLen in [1, 2] and command[0] == 'del':
-		delete_backup(server, info, command[1] if cmdLen == 2 else '1')
 	# confirm
 	elif cmdLen == 1 and command[0] == 'confirm':
 		confirm_restore(server, info)
@@ -398,9 +384,10 @@ def onServerInfo(server, info):
 	# list
 	elif cmdLen == 1 and command[0] == 'list':
 		list_backup(server, info)
-	# share [<slot>]
-	elif cmdLen in [1, 2] and command[0] == 'share':
-		share_backup(server, info, command[1] if cmdLen == 2 else '1')
+	# delete
+	elif cmdLen in [1, 2] and command[0] == 'del':
+		delete_backup(server, info, command[1] if cmdLen == 2 else '1')
+
 	else:
 		print_message(server, info, '参数错误！请输入§7' + Prefix + '§r以获取插件帮助')
 
@@ -413,13 +400,6 @@ def on_info(server, info):
 
 def on_load(server, old):
 	server.add_help_message(Prefix, '备份/回档，{}槽位'.format(SlotCount))
-	global creating_backup, restoring_backup, sharing_backup
-	if hasattr(old, 'creating_backup') and type(old.creating_backup) == type(creating_backup):
-		creating_backup = old.creating_backup
-	if hasattr(old, 'restoring_backup') and type(old.restoring_backup) == type(restoring_backup):
-		restoring_backup = old.restoring_backup
-	if hasattr(old, 'sharing_backup') and type(old.sharing_backup) == type(sharing_backup):
-		sharing_backup = old.sharing_backup
 
 
 def on_unload(server):
